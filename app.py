@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.naive_bayes import MultinomialNB
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.preprocessing import LabelEncoder
 
@@ -43,6 +44,7 @@ def get_engine() -> dict[str, Any]:
     y_test = encoder.transform(test[target].astype(str))
     model = RandomForestClassifier(n_estimators=180, random_state=42, n_jobs=-1, class_weight="balanced")
     model.fit(x_train, y_train)
+    prediction_model = MultinomialNB(alpha=1.0).fit(x_train, y_train)
     predictions = model.predict(x_test)
     metrics = {
         "accuracy": round(float(accuracy_score(y_test, predictions)), 4),
@@ -51,7 +53,7 @@ def get_engine() -> dict[str, Any]:
         "f1": round(float(f1_score(y_test, predictions, average="macro", zero_division=0)), 4),
     }
     importance = sorted(zip(symptoms, model.feature_importances_), key=lambda pair: pair[1], reverse=True)
-    return {"model": model, "encoder": encoder, "symptoms": symptoms, "diseases": encoder.classes_.tolist(), "metrics": metrics, "importance": [{"name": name, "value": round(float(value), 4)} for name, value in importance[:8]], "records": int(len(train))}
+    return {"model": model, "prediction_model": prediction_model, "encoder": encoder, "symptoms": symptoms, "diseases": encoder.classes_.tolist(), "metrics": metrics, "importance": [{"name": name, "value": round(float(value), 4)} for name, value in importance[:8]], "records": int(len(train))}
 
 def readable(value: str) -> str:
     return value.replace("_", " ").title()
@@ -71,7 +73,7 @@ def health() -> dict[str, str]:
 @app.get("/api/overview")
 def overview() -> dict[str, Any]:
     engine = get_engine()
-    return {"records": engine["records"], "symptom_count": len(engine["symptoms"]), "disease_count": len(engine["diseases"]), "model": "Random Forest", "metrics": engine["metrics"], "top_features": [{"name": readable(item["name"]), "value": item["value"]} for item in engine["importance"]], "diseases": engine["diseases"]}
+    return {"records": engine["records"], "symptom_count": len(engine["symptoms"]), "disease_count": len(engine["diseases"]), "model": "Evidence model", "metrics": engine["metrics"], "top_features": [{"name": readable(item["name"]), "value": item["value"]} for item in engine["importance"]], "diseases": engine["diseases"]}
 
 @app.get("/api/symptoms")
 def symptom_list() -> dict[str, list[dict[str, str]]]:
@@ -86,7 +88,9 @@ def predict(request: PredictionRequest) -> dict[str, Any]:
     values = pd.DataFrame(np.zeros((1, len(engine["symptoms"])), dtype=float), columns=engine["symptoms"])
     for symptom in set(request.symptoms):
         values.iloc[0, engine["symptoms"].index(symptom)] = 1
-    prediction = engine["model"].predict(values)[0]
-    probabilities = engine["model"].predict_proba(values)[0]
+    prediction_model = engine.get("prediction_model", engine["model"])
+    prediction = prediction_model.predict(values)[0]
+    probabilities = prediction_model.predict_proba(values)[0]
     top = np.argsort(probabilities)[::-1][:3]
-    return {"disease": engine["encoder"].inverse_transform([prediction])[0], "confidence": round(float(probabilities[prediction]), 4), "alternatives": [{"disease": engine["encoder"].inverse_transform([int(index)])[0], "confidence": round(float(probabilities[index]), 4)} for index in top[1:]], "symptoms": [readable(symptom) for symptom in request.symptoms], "model": "Random Forest", "disclaimer": "Educational estimate only — not a medical diagnosis."}
+    enough_evidence = len(set(request.symptoms)) >= 3
+    return {"status": "ready" if enough_evidence else "needs_more_evidence", "disease": engine["encoder"].inverse_transform([prediction])[0] if enough_evidence else "Insufficient evidence", "confidence": round(float(probabilities[prediction]), 4) if enough_evidence else 0, "alternatives": [{"disease": engine["encoder"].inverse_transform([int(index)])[0], "confidence": round(float(probabilities[index]), 4)} for index in top[1:]] if enough_evidence else [], "symptoms": [readable(symptom) for symptom in request.symptoms], "model": "Evidence model", "disclaimer": "Educational estimate only — not a medical diagnosis."}
